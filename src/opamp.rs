@@ -45,6 +45,8 @@
 //! }
 //! ```
 
+// TODO: Add support for locking using the `LOCK` bit in `OPAMPx_CSR`
+
 macro_rules! opamps {
     {
         $(
