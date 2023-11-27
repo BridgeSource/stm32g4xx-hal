@@ -189,20 +189,21 @@ macro_rules! spi {
                 (self.spi, self.pins)
             }
 
+            /// Checks if the SPI bus is busy
             pub fn is_busy(&self) -> bool {
                 self.spi.sr.read().bsy().bit_is_set()
             }
 
+            /// Waits for the SPI bus to be ready and then writes a byte to data register
             pub fn unchecked_send_u8(&self, data: u8) {
                 while self.is_busy() {}
                 self.spi.dr.write(|w| unsafe { w.dr().bits(data as u16) });
-                //
             }
 
+            /// Waits for the SPI bus to be ready and then writes a u16 to data register
             pub fn unchecked_send_u16(&self, data: u16) {
                 while self.is_busy() {}
                 self.spi.dr.write(|w| unsafe { w.dr().bits(data) });
-                //while self.is_busy() {}
             }
         }
 
