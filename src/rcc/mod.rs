@@ -1,3 +1,4 @@
+use crate::pwr::{self, PowerConfiguration};
 use crate::stm32::{rcc, FLASH, PWR, RCC};
 use crate::time::{Hertz, RateExtU32};
 
@@ -74,7 +75,7 @@ pub struct Rcc {
 
 impl Rcc {
     /// Apply clock configuration
-    pub fn freeze(self, rcc_cfg: Config) -> Self {
+    pub fn freeze(mut self, rcc_cfg: Config, pwr_cfg: PowerConfiguration) -> Self {
         let pll_clk = self.config_pll(rcc_cfg.pll_cfg);
 
         let (sys_clk, sw_bits) = match rcc_cfg.sys_mux {
@@ -122,19 +123,70 @@ impl Rcc {
             _ => (sys_freq, 0b000),
         };
 
-        unsafe {
-            // Adjust flash wait states
-            let flash = &(*FLASH::ptr());
-            flash.acr.modify(|_, w| {
-                w.latency().bits(if sys_freq <= 24_000_000 {
-                    0b000
-                } else if sys_freq <= 48_000_000 {
-                    0b001
-                } else {
-                    0b010
-                })
-            })
+        let present_vos_mode = pwr::current_vos();
+        let target_vos_mode = pwr_cfg.vos();
+
+        match (present_vos_mode, target_vos_mode) {
+            // From VoltageScale::Range1 boost
+            (
+                pwr::VoltageScale::Range1 { enable_boost: true },
+                pwr::VoltageScale::Range1 { enable_boost: true },
+            ) => (), // No change
+            (
+                pwr::VoltageScale::Range1 { enable_boost: true },
+                pwr::VoltageScale::Range1 {
+                    enable_boost: false,
+                },
+            ) => todo!(),
+            (pwr::VoltageScale::Range1 { enable_boost: true }, pwr::VoltageScale::Range2) => {
+                todo!()
+            }
+
+            // From VoltageScale::Range1 normal
+            (
+                pwr::VoltageScale::Range1 {
+                    enable_boost: false,
+                },
+                pwr::VoltageScale::Range1 { enable_boost: true },
+            ) => {
+                self.range1_normal_to_boost(
+                    &pwr_cfg,
+                    sys_freq,
+                    apb1_psc_bits,
+                    apb2_psc_bits,
+                    sw_bits,
+                    ahb_psc_bits,
+                );
+            }
+            (
+                pwr::VoltageScale::Range1 {
+                    enable_boost: false,
+                },
+                pwr::VoltageScale::Range1 {
+                    enable_boost: false,
+                },
+            ) => (), // No change
+            (
+                pwr::VoltageScale::Range1 {
+                    enable_boost: false,
+                },
+                pwr::VoltageScale::Range2,
+            ) => todo!(),
+
+            // From VoltageScale::Range2
+            (pwr::VoltageScale::Range2, pwr::VoltageScale::Range1 { enable_boost: true }) => {
+                todo!()
+            }
+            (
+                pwr::VoltageScale::Range2,
+                pwr::VoltageScale::Range1 {
+                    enable_boost: false,
+                },
+            ) => todo!(),
+            (pwr::VoltageScale::Range2, pwr::VoltageScale::Range2) => (), // No change
         }
+
+        Self::configure_wait_states(&pwr_cfg, sys_freq);
 
         self.rb.cfgr.modify(|_, w| unsafe {
             w.hpre()
@@ -267,6 +319,103 @@ impl Rcc {
         }
     }
 
+    fn configure_wait_states(pwr_cfg: &PowerConfiguration, sys_freq: u32) {
+        // Calculate wait states depending on voltage scale and sys_freq
+        //
+        // See 'Number of wait states according to CPU clock (HCLK) frequency' in RM0440
+        let latency = match pwr_cfg.vos() {
+            pwr::VoltageScale::Range1 { enable_boost: true } => match sys_freq {
+                0..=34_000_000 => 0b0000,
+                34_000_001..=68_000_000 => 0b0001,
+                68_000_001..=102_000_000 => 0b0010,
+                102_000_001..=136_000_000 => 0b0011,
+                136_000_001..=170_000_000 => 0b0100,
+                170_000_001.. => panic!(
+                    "Too high f_sys: {}, max with voltage scale in 'range1 boost mode' is: 170MHz",
+                    sys_freq
+                ),
+            },
+            pwr::VoltageScale::Range1 {
+                enable_boost: false,
+            } => match sys_freq {
+                0..=30_000_000 => 0b0000,
+                30_000_001..=60_000_000 => 0b0001,
+                60_000_001..=90_000_000 => 0b0010,
+                90_000_001..=120_000_000 => 0b0011,
+                120_000_001..=150_000_000 => 0b0100,
+                150_000_001.. => panic!(
+                    "Too high f_sys: {}, max with voltage scale in 'range1 normal mode' is: 150MHz",
+                    sys_freq
+                ),
+            },
+            pwr::VoltageScale::Range2 => match sys_freq {
+                0..=12_000_000 => 0b0000,
+                12_000_001..=24_000_000 => 0b0001,
+                24_000_001..=26_000_000 => 0b0010,
+                26_000_001.. => panic!(
+                    "Too high f_sys: {}, max with voltage scale in 'range2' is: 26MHz",
+                    sys_freq
+                ),
+            },
+        };
+
+        unsafe {
+            // Adjust flash wait states
+            let flash = &(*FLASH::ptr());
+            flash.acr.modify(|_, w| w.latency().bits(latency))
+        }
+    }
+
+    fn range1_normal_to_boost(
+        &mut self,
+        pwr_cfg: &PowerConfiguration,
+        sys_freq: u32,
+        apb1_psc_bits: u8,
+        apb2_psc_bits: u8,
+        sw_bits: u8,
+        ahb_psc_bits: u8,
+    ) {
+        // (From RM0440 chapter "Power control (PWR)")
+        // The sequence to switch from Range11 normal mode to Range1 boost mode is:
+        // 1. The system clock must be divided by 2 using the AHB prescaler before switching to a
+        // higher system frequency.
+        let half_apb = (self.rb.cfgr.read().hpre().bits() + 1).clamp(0b1000, 0b1111);
+        self.rb
+            .cfgr
+            .modify(|_r, w| unsafe { w.hpre().bits(half_apb) });
+        while self.rb.cfgr.read().hpre().bits() != half_apb {}
+
+        // 2. Clear the R1MODE bit is in the PWR_CR5 register.
+        unsafe { pwr::set_boost(true) };
+
+        // 3. Adjust the number of wait states according to the new frequency target in range1 boost mode
+        Self::configure_wait_states(pwr_cfg, sys_freq);
+
+        // 4. Configure and switch to new system frequency.
+        self.rb.cfgr.modify(|_, w| unsafe {
+            w.ppre1()
+                .bits(apb1_psc_bits)
+                .ppre2()
+                .bits(apb2_psc_bits)
+                .sw()
+                .bits(sw_bits)
+        });
+
+        while self.rb.cfgr.read().sws().bits() != sw_bits {}
+
+        // 5. Wait for at least 1us and then reconfigure the AHB prescaler to get the needed HCLK
+        // clock frequency.
+        let us_per_s = 1_000_000;
+        // Number of cycles @ sys_freq for 1us, rounded up, this will
+        // likely end up being 2us since the AHB prescaler is changed
+        let delay_cycles = (sys_freq + us_per_s - 1) / us_per_s;
+        cortex_m::asm::delay(delay_cycles);
+
+        self.rb
+            .cfgr
+            .modify(|_, w| unsafe { w.hpre().bits(ahb_psc_bits) });
+    }
+
     pub(crate) fn enable_hsi(&self) {
         self.rb.cr.modify(|_, w| w.hsion().set_bit());
         while self.rb.cr.read().hsirdy().bit_is_clear() {}
@@ -290,6 +439,61 @@ impl Rcc {
         self.rb.csr.modify(|_, w| w.lsion().set_bit());
         while self.rb.csr.read().lsirdy().bit_is_clear() {}
     }
+
+    pub fn get_reset_reason(&self) -> ResetReason {
+        let csr = self.rb.csr.read();
+
+        ResetReason {
+            low_power: csr.lpwrstf().bit(),
+            window_watchdog: csr.wwdgrstf().bit(),
+            independent_watchdog: csr.iwdgrstf().bit(),
+            software: csr.sftrstf().bit(),
+            brown_out: csr.borrstf().bit(),
+            reset_pin: csr.pinrstf().bit(),
+            option_byte: csr.oblrstf().bit(),
+        }
+    }
+
+    pub fn clear_reset_reason(&mut self) {
+        self.rb.csr.modify(|_, w| w.rmvf().set_bit());
+    }
+}
+
+pub struct ResetReason {
+    /// Low-power reset flag
+    ///
+    /// Set by hardware when a reset occurs to illegal Stop, Standby or Shutdown mode entry.
+    pub low_power: bool,
+
+    /// Window watchdog reset flag
+    ///
+    /// Set by hardware when a window watchdog reset occurs.
+    pub window_watchdog: bool,
+
+    /// Independent window watchdog reset flag
+    ///
+    /// Set by hardware when an independent watchdog reset occurs.
+    pub independent_watchdog: bool,
+
+    /// Software reset flag
+    ///
+    /// Set by hardware when a software reset occurs.
+    pub software: bool,
+
+    /// Brown out reset flag
+    ///
+    /// Set by hardware when a brown out reset occurs.
+    pub brown_out: bool,
+
+    /// Pin reset flag
+    ///
+    /// Set by hardware when a reset from the NRST pin occurs.
+    pub reset_pin: bool,
+
+    /// Option byte loader reset flag
+    ///
+    /// Set by hardware when a reset from the Option Byte loading occurs.
+    pub option_byte: bool,
 }
 
 /// Extension trait that constrains the `RCC` peripheral
@@ -298,7 +502,7 @@ pub trait RccExt {
     fn constrain(self) -> Rcc;
 
     /// Constrains the `RCC` peripheral and apply clock configuration
-    fn freeze(self, rcc_cfg: Config) -> Rcc;
+    fn freeze(self, rcc_cfg: Config, pwr_config: PowerConfiguration) -> Rcc;
 }
 
 impl RccExt for RCC {
@@ -309,8 +513,8 @@ impl RccExt for RCC {
         }
     }
 
-    fn freeze(self, rcc_cfg: Config) -> Rcc {
-        self.constrain().freeze(rcc_cfg)
+    fn freeze(self, rcc_cfg: Config, pwr_config: PowerConfiguration) -> Rcc {
+        self.constrain().freeze(rcc_cfg, pwr_config)
     }
 }
 
@@ -328,6 +532,7 @@ impl AHB1 {
     fn rstr(rcc: &RccRB) -> &rcc::AHB1RSTR {
         &rcc.ahb1rstr
     }
+    #[allow(unused)]
     #[inline(always)]
     fn smenr(rcc: &RccRB) -> &rcc::AHB1SMENR {
         &rcc.ahb1smenr
@@ -346,6 +551,7 @@ impl AHB2 {
     fn rstr(rcc: &RccRB) -> &rcc::AHB2RSTR {
         &rcc.ahb2rstr
     }
+    #[allow(unused)]
     #[inline(always)]
     fn smenr(rcc: &RccRB) -> &rcc::AHB2SMENR {
         &rcc.ahb2smenr
@@ -356,14 +562,17 @@ pub struct AHB3 {
     _0: (),
 }
 impl AHB3 {
+    #[allow(unused)]
     #[inline(always)]
     fn enr(rcc: &RccRB) -> &rcc::AHB3ENR {
         &rcc.ahb3enr
     }
+    #[allow(unused)]
     #[inline(always)]
     fn rstr(rcc: &RccRB) -> &rcc::AHB3RSTR {
         &rcc.ahb3rstr
     }
+    #[allow(unused)]
     #[inline(always)]
     fn smenr(rcc: &RccRB) -> &rcc::AHB3SMENR {
         &rcc.ahb3smenr
@@ -382,6 +591,7 @@ impl APB1_1 {
     fn rstr(rcc: &RccRB) -> &rcc::APB1RSTR1 {
         &rcc.apb1rstr1
     }
+    #[allow(unused)]
     #[inline(always)]
     fn smenr(rcc: &RccRB) -> &rcc::APB1SMENR1 {
         &rcc.apb1smenr1
@@ -400,6 +610,7 @@ impl APB1_2 {
     fn rstr(rcc: &RccRB) -> &rcc::APB1RSTR2 {
         &rcc.apb1rstr2
     }
+    #[allow(unused)]
     #[inline(always)]
     fn smenr(rcc: &RccRB) -> &rcc::APB1SMENR2 {
         &rcc.apb1smenr2
@@ -418,6 +629,7 @@ impl APB2 {
     fn rstr(rcc: &RccRB) -> &rcc::APB2RSTR {
         &rcc.apb2rstr
     }
+    #[allow(unused)]
     #[inline(always)]
     fn smenr(rcc: &RccRB) -> &rcc::APB2SMENR {
         &rcc.apb2smenr

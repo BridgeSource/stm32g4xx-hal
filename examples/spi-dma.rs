@@ -1,12 +1,10 @@
-// This example is to test the SPI without any external devices.
-// It puts "Hello world!" on the mosi-line and logs whatever is received on the miso-line to the info level.
-// The idea is that you should connect miso and mosi, so you will also receive "Hello world!".
+// This example is to test the SPI with DMA support. Will output a pattern
+// in a loop
 
 #![no_main]
 #![no_std]
 
 use crate::hal::{
-    block,
     delay::DelayFromCountDownTimer,
     gpio::gpioa::PA5,
     gpio::gpioa::PA6,
@@ -23,11 +21,15 @@ use crate::hal::{
 };
 
 use cortex_m_rt::entry;
-use log::info;
 use stm32g4xx_hal as hal;
+use stm32g4xx_hal::dma::config::DmaConfig;
+use stm32g4xx_hal::dma::stream::DMAExt;
+use stm32g4xx_hal::dma::TransferExt;
 
 #[macro_use]
 mod utils;
+
+const BUFFER_SIZE: usize = 254;
 
 #[entry]
 fn main() -> ! {
@@ -45,25 +47,27 @@ fn main() -> ! {
     let miso: PA6<Alternate<AF5>> = gpioa.pa6.into_alternate();
     let mosi: PA7<Alternate<AF5>> = gpioa.pa7.into_alternate();
 
-    let mut spi = dp
+    let spi = dp
         .SPI1
         .spi((sclk, miso, mosi), spi::MODE_0, 400.kHz(), &mut rcc);
-    let mut cs = gpioa.pa8.into_push_pull_output();
-    cs.set_high().unwrap();
+    let streams = dp.DMA1.split(&rcc);
+    let config = DmaConfig::default()
+        .transfer_complete_interrupt(false)
+        .circular_buffer(true)
+        .memory_increment(true);
 
-    // "Hello world!"
-    let message: [char; 12] = ['H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', '!'];
-    let mut received_byte: u8;
-
+    let mut buf: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
+    /* Set a some datas */
+    for (index, item) in buf.iter_mut().enumerate().take(BUFFER_SIZE) {
+        *item = index as u8;
+    }
+    let dma_buf = cortex_m::singleton!(: [u8; BUFFER_SIZE] = buf).unwrap();
+    let mut transfer_dma =
+        streams
+            .0
+            .into_memory_to_peripheral_transfer(spi.enable_tx_dma(), &mut dma_buf[..], config);
+    transfer_dma.start(|_spi| {});
     loop {
-        for byte in message.iter() {
-            cs.set_low().unwrap();
-            spi.send(*byte as u8).unwrap();
-            received_byte = block!(spi.read()).unwrap();
-            cs.set_high().unwrap();
-
-            info!("{}", received_byte as char);
-        }
         delay_tim2.delay_ms(1000_u16);
     }
 }

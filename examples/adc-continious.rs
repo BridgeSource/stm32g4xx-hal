@@ -3,19 +3,21 @@
 
 use crate::hal::{
     adc::{
-        config::{Continuous, SampleTime, Sequence},
+        config::{Continuous, Resolution, SampleTime, Sequence},
         AdcClaim, ClockSource, Temperature, Vref,
     },
     delay::SYSTDelayExt,
     gpio::GpioExt,
+    pwr::PwrExt,
     rcc::{Config, RccExt},
+    signature::{VrefCal, VDDA_CALIB},
     stm32::Peripherals,
 };
 use stm32g4xx_hal as hal;
 
 use cortex_m_rt::entry;
 
-use log::info;
+use utils::logger::info;
 
 #[macro_use]
 mod utils;
@@ -32,7 +34,8 @@ fn main() -> ! {
     info!("rcc");
 
     let rcc = dp.RCC.constrain();
-    let mut rcc = rcc.freeze(Config::hsi());
+    let pwr = dp.PWR.constrain().freeze();
+    let mut rcc = rcc.freeze(Config::hsi(), pwr);
 
     info!("Setup Gpio");
     let gpioa = dp.GPIOA.split(&mut rcc);
@@ -63,11 +66,17 @@ fn main() -> ! {
         info!("pa3: {}mV", millivolts);
 
         adc = adc.wait_for_conversion_sequence().unwrap_active();
-        let millivolts = Vref::sample_to_millivolts(adc.current_sample());
+        let vref_sample = adc.current_sample();
+        let millivolts = Vref::sample_to_millivolts(vref_sample);
+        let vdda = VDDA_CALIB * VrefCal::get().read() as u32 / vref_sample as u32;
         info!("vref: {}mV", millivolts);
 
         adc = adc.wait_for_conversion_sequence().unwrap_active();
-        let millivolts = Temperature::temperature_to_degrees_centigrade(adc.current_sample());
-        info!("temp: {}℃C", millivolts); // Note: Temperature seems quite low...
+        let temp = Temperature::temperature_to_degrees_centigrade(
+            adc.current_sample(),
+            vdda as f32 / 1000.,
+            Resolution::Twelve,
+        );
+        info!("temp: {}°C", temp);
     }
 }

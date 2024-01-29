@@ -5,12 +5,13 @@ use cortex_m_rt::entry;
 
 use crate::hal::{
     adc::{
-        config::{Continuous, Dma as AdcDma, SampleTime, Sequence},
+        config::{Continuous, Dma as AdcDma, Resolution, SampleTime, Sequence},
         AdcClaim, ClockSource, Temperature,
     },
     delay::SYSTDelayExt,
     dma::{config::DmaConfig, stream::DMAExt, TransferExt},
     gpio::GpioExt,
+    pwr::PwrExt,
     rcc::{Config, RccExt},
     stm32::Peripherals,
 };
@@ -33,7 +34,8 @@ fn main() -> ! {
     info!("rcc");
 
     let rcc = dp.RCC.constrain();
-    let mut rcc = rcc.freeze(Config::hsi());
+    let pwr = dp.PWR.constrain().freeze();
+    let mut rcc = rcc.freeze(Config::hsi(), pwr);
 
     let mut streams = dp.DMA1.split(&rcc);
     let config = DmaConfig::default()
@@ -79,8 +81,11 @@ fn main() -> ! {
 
     let millivolts = adc.sample_to_millivolts(first_buffer[0]);
     info!("pa3: {}mV", millivolts);
-    let millivolts = Temperature::temperature_to_degrees_centigrade(first_buffer[1]);
-    info!("temp: {}℃C", millivolts); // Note: Temperature seems quite low...
+
+    // Assume vdda is 3.3V, see adc-continious.rs for an example of measuring VDDA using VREF
+    let temp =
+        Temperature::temperature_to_degrees_centigrade(first_buffer[1], 3.3, Resolution::Twelve);
+    info!("temp: {}°C", temp);
 
     #[allow(clippy::empty_loop)]
     loop {}
